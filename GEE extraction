@@ -1,0 +1,225 @@
+/***********************************************************
+  RESEARCH-GRADE MULTI-SEASON CROP FEATURE EXTRACTION
+  Includes:
+  - Cropland Mask
+  - Growing Season Max NDVI
+  - NDVI Anomaly
+  - Radar Ratio
+  - Kharif + Rabi Seasonal Extraction
+  - State-wise Export
+***********************************************************/
+
+
+// ========================================================
+// 1️⃣ LOAD INDIA STATES & DISTRICTS
+// ========================================================
+
+var states = ee.FeatureCollection("FAO/GAUL/2015/level1")
+                .filter(ee.Filter.eq('ADM0_NAME', 'India'));
+
+var districts = ee.FeatureCollection("FAO/GAUL/2015/level2")
+                    .filter(ee.Filter.eq('ADM0_NAME', 'India'));
+
+
+// ========================================================
+// 2️⃣ CROPLAND MASK (ESA WORLDCOVER)
+// ========================================================
+// Class 40 = Cropland
+
+var worldcover = ee.Image("ESA/WorldCover/v100/2020");
+var croplandMask = worldcover.eq(40);
+
+function applyCroplandMask(image) {
+  return image.updateMask(croplandMask);
+}
+
+
+// ========================================================
+// 3️⃣ CLOUD MASK FUNCTION (SENTINEL-2)
+// ========================================================
+
+function maskS2(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+               .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  return image.updateMask(mask).divide(10000);
+}
+
+
+// ========================================================
+// 4️⃣ DEFINE CROP SEASONS
+// ========================================================
+
+var seasons = [
+  {name: 'Kharif', startMonth: 6, endMonth: 10},
+  {name: 'Rabi', startMonth: 11, endMonth: 3}
+];
+
+var years = ee.List.sequence(2016, 2023);
+
+
+// ========================================================
+// 5️⃣ FEATURE EXTRACTION FUNCTION
+// ========================================================
+
+function extractSeasonalFeatures(year, season) {
+
+  var startMonth = season.startMonth;
+  var endMonth = season.endMonth;
+
+  var startDate = ee.Date.fromYMD(year, startMonth, 1);
+
+  var endDate = ee.Algorithms.If(
+    endMonth < startMonth,
+    ee.Date.fromYMD(ee.Number(year).add(1), endMonth, 30),
+    ee.Date.fromYMD(year, endMonth, 30)
+  );
+
+  endDate = ee.Date(endDate);
+
+  // ------------------------
+  // Sentinel-2 NDVI
+  // ------------------------
+
+  var s2 = ee.ImageCollection("COPERNICUS/S2_SR")
+              .filterDate(startDate, endDate)
+              .filterBounds(districts)
+              .map(maskS2)
+              .map(function(img){
+                return img.normalizedDifference(['B8','B4'])
+                          .rename('NDVI');
+              });
+
+  // Apply cropland mask
+  s2 = s2.map(applyCroplandMask);
+
+  var maxNDVI = s2.max().rename('Max_NDVI');
+  var meanNDVI = s2.mean().rename('Mean_NDVI');
+
+  // Long-term mean NDVI (2016–2023)
+  var longTermNDVI = ee.ImageCollection("COPERNICUS/S2_SR")
+                        .filterDate('2016-01-01', '2023-12-31')
+                        .filterBounds(districts)
+                        .map(maskS2)
+                        .map(function(img){
+                          return img.normalizedDifference(['B8','B4']);
+                        })
+                        .mean();
+
+  var anomaly = meanNDVI.subtract(longTermNDVI)
+                         .rename('NDVI_Anomaly');
+
+
+  // ------------------------
+  // Sentinel-1 Radar
+  // ------------------------
+
+  var s1 = ee.ImageCollection("COPERNICUS/S1_GRD")
+              .filterDate(startDate, endDate)
+              .filterBounds(districts)
+              .filter(ee.Filter.eq('instrumentMode','IW'))
+              .filter(ee.Filter.listContains(
+                'transmitterReceiverPolarisation','VV'))
+              .filter(ee.Filter.listContains(
+                'transmitterReceiverPolarisation','VH'))
+              .select(['VV','VH'])
+              .median();
+
+  var ratio = s1.select('VV')
+                .divide(s1.select('VH'))
+                .rename('VV_VH_ratio');
+
+
+  // ------------------------
+  // Rainfall (CHIRPS)
+  // ------------------------
+
+  var rainfall = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+                    .filterDate(startDate, endDate)
+                    .sum()
+                    .rename('Seasonal_Rainfall');
+
+
+  // ------------------------
+  // Temperature (ERA5)
+  // ------------------------
+
+  var temperature = ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY")
+                        .filterDate(startDate, endDate)
+                        .select('temperature_2m')
+                        .mean()
+                        .subtract(273.15)
+                        .rename('Seasonal_Temp');
+
+
+  // ------------------------
+  // Combine all features
+  // ------------------------
+
+  var combined = maxNDVI
+                  .addBands(meanNDVI)
+                  .addBands(anomaly)
+                  .addBands(s1)
+                  .addBands(ratio)
+                  .addBands(rainfall)
+                  .addBands(temperature);
+
+  // Zonal statistics
+  var zonal = combined.reduceRegions({
+    collection: districts,
+    reducer: ee.Reducer.mean(),
+    scale: 500
+  });
+
+  zonal = zonal.map(function(f){
+    return f.set({
+      'Year': year,
+      'Season': season.name
+    });
+  });
+
+  return zonal;
+}
+
+
+// ========================================================
+// 6️⃣ GENERATE FULL DATASET
+// ========================================================
+
+var finalCollection = ee.FeatureCollection(
+  years.map(function(y){
+    return seasons.map(function(season){
+      return extractSeasonalFeatures(y, season);
+    });
+  }).flatten()
+).flatten();
+
+
+// ========================================================
+// 7️⃣ EXPORT STATE-WISE
+// ========================================================
+
+states.evaluate(function(stateList){
+
+  stateList.features.forEach(function(state){
+
+    var stateName = state.properties.ADM1_NAME;
+
+    var stateGeom = ee.Feature(state).geometry();
+
+    var stateData = finalCollection
+                      .filterBounds(stateGeom);
+
+    Export.table.toDrive({
+      collection: stateData,
+      description: 'Crop_Features_' + stateName,
+      fileFormat: 'CSV'
+    });
+
+  });
+
+});
